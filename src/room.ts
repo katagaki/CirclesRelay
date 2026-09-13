@@ -251,9 +251,9 @@ export class Room extends DurableObject<PushEnv> {
       if (pending.has(id) || this.holds(record.d, record.n)) continue;
       pending.add(id);
     }
-    if (pending.size > MAX_STORED_RECORDS) throw new Fail(CLOSE_STORAGE_FULL, "room is full");
-    const overflow = this.count() + pending.size - MAX_STORED_RECORDS;
-    if (overflow > 0) this.evict(overflow);
+    if (this.count() + pending.size > MAX_STORED_RECORDS) {
+      throw new Fail(CLOSE_STORAGE_FULL, "room is full");
+    }
 
     const now = Math.floor(Date.now() / 1000);
     const fresh: Record[] = [];
@@ -336,13 +336,6 @@ export class Room extends DurableObject<PushEnv> {
 
   private holds(device: string, seq: number): boolean {
     return this.sql.exec("SELECT 1 FROM ops WHERE device = ? AND seq = ? LIMIT 1", device, seq).toArray().length > 0;
-  }
-
-  private evict(rows: number): void {
-    this.sql.exec(
-      "DELETE FROM ops WHERE (device, seq) IN (SELECT device, seq FROM ops ORDER BY ts, device, seq LIMIT ?)",
-      rows,
-    );
   }
 
   private count(): number {

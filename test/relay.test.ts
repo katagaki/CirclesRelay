@@ -224,20 +224,19 @@ describe("limits", () => {
     const probe = await record(key, "aaaaaaaa", seq, "probe");
     a.send({ t: "ops", o: [probe] });
 
-    // A record the room already holds is not fresh, so it must not reach b. Were it
-    // counted as new it would evict the oldest row, be re-inserted, and arrive here
-    // ahead of the probe.
-    expect(await b.next()).toEqual({ t: "ops", o: [probe] });
-    expect(a.closed).toBeNull();
+    // A record the room already holds is not fresh, so it does not consume capacity.
+    // The genuinely new probe is rejected without deleting any reconstructive history.
+    expect((await a.closure()).code).toBe(4005);
+    await b.quiet();
     await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) => {
       expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM ops").one().c)).toBe(500);
       const held = state.storage.sql.exec("SELECT seq FROM ops ORDER BY seq").toArray().map((row) => Number(row.seq));
-      expect(held[0]).toBe(2);
-      expect(held[held.length - 1]).toBe(seq);
+      expect(held[0]).toBe(1);
+      expect(held[held.length - 1]).toBe(seq - 1);
     });
   });
 
-  it("evicts the oldest records once the room is full", async () => {
+  it("rejects new records rather than evicting history once the room is full", async () => {
     const room = roomId();
     const key = authKey();
     const a = await join(room, key, "aaaaaaaa", {}, true);
@@ -250,14 +249,12 @@ describe("limits", () => {
       a.send({ t: "ops", o: ops });
     }
     a.send({ t: "ops", o: [await record(key, "aaaaaaaa", seq, "overflow")] });
-    await stored(room, "aaaaaaaa", seq);
-
-    expect(a.closed).toBeNull();
+    expect((await a.closure()).code).toBe(4005);
     await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) => {
       expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM ops").one().c)).toBe(500);
       const held = state.storage.sql.exec("SELECT seq FROM ops ORDER BY seq").toArray();
-      expect(Number(held[held.length - 1].seq)).toBe(seq);
-      expect(held.some((row) => Number(row.seq) === 1)).toBe(false);
+      expect(Number(held[held.length - 1].seq)).toBe(seq - 1);
+      expect(held.some((row) => Number(row.seq) === 1)).toBe(true);
     });
   });
 });

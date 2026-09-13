@@ -285,6 +285,17 @@ describe("record authorship", () => {
     const late = await join(room, key, "cccccccc");
     expect(await late.next()).toEqual({ t: "ops", o: [real] });
   });
+
+  it("rejects a room member claiming a registered device without its device key", async () => {
+    const room = roomId();
+    const key = authKey();
+    const owner = await join(room, key, "aaaaaaaa", {}, true);
+    await owner.next();
+
+    const impostor = await Client.connect(room);
+    impostor.send(await helloFrame(key, "aaaaaaaa", {}, { deviceKey: authKey() }));
+    expect((await impostor.closure()).code).toBe(4004);
+  });
 });
 
 describe("hibernation", () => {

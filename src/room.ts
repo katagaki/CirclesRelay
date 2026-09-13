@@ -96,6 +96,10 @@ export class Room extends DurableObject<PushEnv> {
       env      TEXT    NOT NULL,
       pushed   INTEGER NOT NULL
     )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS devices (
+      device   TEXT PRIMARY KEY,
+      auth_key BLOB NOT NULL
+    )`);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -138,6 +142,7 @@ export class Room extends DurableObject<PushEnv> {
     this.sql.exec("DELETE FROM ops");
     this.sql.exec("DELETE FROM room");
     this.sql.exec("DELETE FROM tokens");
+    this.sql.exec("DELETE FROM devices");
     for (const ws of this.ctx.getWebSockets()) ws.close(1001, "room expired");
   }
 
@@ -175,7 +180,7 @@ export class Room extends DurableObject<PushEnv> {
 
   private async onHello(
     ws: WebSocket,
-    frame: { d?: unknown; v?: unknown; k?: unknown; ts?: unknown; a?: unknown; p?: unknown },
+    frame: { d?: unknown; v?: unknown; k?: unknown; ts?: unknown; a?: unknown; x?: unknown; da?: unknown; p?: unknown },
     attachment: Attachment,
   ): Promise<void> {
     if (attachment.d) throw new Fail(CLOSE_PROTOCOL, "duplicate hello");
@@ -201,6 +206,15 @@ export class Room extends DurableObject<PushEnv> {
     const expected = await tag(key, helloInput(device, frame.ts));
     if (!timingSafeEqual(expected, offered)) throw new Fail(CLOSE_AUTH, "bad tag");
 
+    const registeredDeviceKey = this.deviceKey(device);
+    const suppliedDeviceKey = b64urlDecode(frame.x);
+    const deviceKeyBytes = registeredDeviceKey ?? suppliedDeviceKey;
+    if (!deviceKeyBytes || deviceKeyBytes.length !== 32) throw new Fail(CLOSE_AUTH, "device key required");
+    const deviceOffered = b64urlDecode(frame.da);
+    if (!deviceOffered || deviceOffered.length !== TAG_LEN) throw new Fail(CLOSE_AUTH, "bad device tag");
+    const deviceExpected = await tag(await importAuthKey(deviceKeyBytes), helloInput(device, frame.ts));
+    if (!timingSafeEqual(deviceExpected, deviceOffered)) throw new Fail(CLOSE_AUTH, "bad device tag");
+
     if (!existing) {
       this.sql.exec(
         "INSERT INTO room (id, auth_key, created_at) VALUES (1, ?, ?)",
@@ -208,6 +222,9 @@ export class Room extends DurableObject<PushEnv> {
         Math.floor(Date.now() / 1000),
       );
       await this.ctx.storage.setAlarm(Date.now() + ROOM_TTL_MS);
+    }
+    if (!registeredDeviceKey) {
+      this.sql.exec("INSERT INTO devices (device, auth_key) VALUES (?, ?)", device, deviceKeyBytes);
     }
 
     attachment.d = device;
@@ -331,6 +348,11 @@ export class Room extends DurableObject<PushEnv> {
 
   private authKey(): Uint8Array | null {
     const row = this.sql.exec("SELECT auth_key FROM room WHERE id = 1").toArray()[0];
+    return row ? toBytes(row.auth_key as ArrayBuffer) : null;
+  }
+
+  private deviceKey(device: string): Uint8Array | null {
+    const row = this.sql.exec("SELECT auth_key FROM devices WHERE device = ?", device).toArray()[0];
     return row ? toBytes(row.auth_key as ArrayBuffer) : null;
   }
 

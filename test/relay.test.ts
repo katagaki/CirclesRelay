@@ -260,6 +260,15 @@ describe("limits", () => {
 });
 
 describe("record authorship", () => {
+  it("rejects sequence zero to match both client protocols", async () => {
+    const room = roomId();
+    const key = authKey();
+    const client = await join(room, key, "aaaaaaaa", {}, true);
+    await client.next();
+    client.send({ t: "ops", o: [await record(key, "aaaaaaaa", 0, "zero")] });
+    expect((await client.closure()).code).toBe(4002);
+  });
+
   it("closes 4004 on a record claiming another device", async () => {
     const room = roomId();
     const key = authKey();

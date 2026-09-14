@@ -70,6 +70,10 @@ function isSeq(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isPositiveSeq(value: unknown): value is number {
+  return isSeq(value) && value > 0;
+}
+
 export class Room extends DurableObject<PushEnv> {
   private sql: SqlStorage;
 
@@ -252,7 +256,7 @@ export class Room extends DurableObject<PushEnv> {
       const { d, n, b, a } = entry as Record;
       if (typeof d !== "string" || !DEVICE_ID.test(d)) throw new Fail(CLOSE_PROTOCOL, "bad device id");
       if (d !== attachment.d) throw new Fail(CLOSE_AUTH, "device mismatch");
-      if (!isSeq(n)) throw new Fail(CLOSE_PROTOCOL, "bad seq");
+      if (!isPositiveSeq(n)) throw new Fail(CLOSE_PROTOCOL, "bad seq");
       const blob = b64urlDecode(b);
       const offered = b64urlDecode(a);
       if (!blob || blob.length === 0) throw new Fail(CLOSE_PROTOCOL, "bad blob");

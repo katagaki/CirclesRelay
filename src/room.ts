@@ -242,6 +242,7 @@ export class Room extends DurableObject<PushEnv> {
     attachment.d = device;
     ws.serializeAttachment(attachment);
     this.register(device, frame.p);
+    ws.send(JSON.stringify({ t: "held", n: this.heldPrefix(device) }));
     this.send(ws, this.missing(frame.v));
   }
 
@@ -401,6 +402,16 @@ export class Room extends DurableObject<PushEnv> {
 
   private holds(device: string, seq: number): boolean {
     return this.sql.exec("SELECT 1 FROM ops WHERE device = ? AND seq = ? LIMIT 1", device, seq).toArray().length > 0;
+  }
+
+  private heldPrefix(device: string): number {
+    let next = 1;
+    for (const row of this.sql.exec("SELECT seq FROM ops WHERE device = ? ORDER BY seq", device)) {
+      const seq = Number(row.seq);
+      if (seq > next) break;
+      if (seq === next) next++;
+    }
+    return next - 1;
   }
 
   private count(): number {

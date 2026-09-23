@@ -343,6 +343,23 @@ sessionTag    = HMAC-SHA256(sessionKey,   "ble" ‖ u64be(window))[0..2]    <spa
 
     <div class="frame">
       <div class="frame-head">
+        <h3 class="mono">held</h3>
+        <span class="size">relay → client · once, right after a verified hello</span>
+      </div>
+      <pre>{
+  <span class="k">"t"</span>: "held",
+  <span class="k">"n"</span>: 41                       <span class="c">// highest gapless seq the relay holds for the hello device</span>
+}</pre>
+      <p>
+        Sent before the <code>ops</code> reply to the hello, so a client uploads only its own records
+        above <code>n</code> instead of its whole history on every reconnect. A client that sees the
+        hello's <code>ops</code> reply without a <code>held</code> ahead of it is talking to an older
+        relay and falls back to uploading everything it authored.
+      </p>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
         <h3 class="mono">ops</h3>
         <span class="size">both directions · 1–32 records</span>
       </div>

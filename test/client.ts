@@ -82,12 +82,18 @@ export class Client {
     this.ws.send(typeof frame === "string" ? frame : JSON.stringify(frame));
   }
 
+  held: number | null = null;
+
   async next(): Promise<any> {
-    while (this.messages.length === 0) {
-      if (this.closed) throw new Error(`closed with ${this.closed.code}`);
-      await this.settle();
+    for (;;) {
+      while (this.messages.length === 0) {
+        if (this.closed) throw new Error(`closed with ${this.closed.code}`);
+        await this.settle();
+      }
+      const frame = JSON.parse(this.messages.shift()!);
+      if (frame.t !== "held") return frame;
+      this.held = frame.n;
     }
-    return JSON.parse(this.messages.shift()!);
   }
 
   async nextRaw(): Promise<string> {

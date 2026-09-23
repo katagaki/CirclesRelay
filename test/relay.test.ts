@@ -77,6 +77,27 @@ describe("fan-out", () => {
     await late.quiet();
   });
 
+  it("tells a device how much of its own history it already holds", async () => {
+    const room = roomId();
+    const key = authKey();
+    const first = await join(room, key, "aaaaaaaa", {}, true);
+    const firstReply = JSON.parse(await first.nextRaw());
+    expect(firstReply).toEqual({ t: "held", n: 0 });
+    first.send({
+      t: "ops",
+      o: [
+        await record(key, "aaaaaaaa", 1, "one"),
+        await record(key, "aaaaaaaa", 2, "two"),
+        await record(key, "aaaaaaaa", 4, "four"),
+      ],
+    });
+    await stored(room, "aaaaaaaa", 4);
+
+    const again = await join(room, key, "aaaaaaaa", { aaaaaaaa: 4 });
+    expect(JSON.parse(await again.nextRaw())).toEqual({ t: "held", n: 2 });
+    expect(await again.next()).toEqual({ t: "ops", o: [] });
+  });
+
   it("ignores a re-sent record and does not fan it out", async () => {
     const room = roomId();
     const key = authKey();

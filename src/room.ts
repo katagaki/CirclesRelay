@@ -17,6 +17,8 @@ export const MAX_RECORDS_PER_FRAME = 32;
 export const RATE_TOKENS = 20;
 export const RATE_WINDOW_MS = 10_000;
 export const MAX_SOCKETS = 8;
+export const MAX_PENDING_SOCKETS = 4;
+export const HELLO_DEADLINE_MS = 10_000;
 export const MAX_STORED_RECORDS = 500;
 export const HELLO_SKEW_SECONDS = 300;
 export const ROOM_TTL_MS = 48 * 60 * 60 * 1000;
@@ -30,6 +32,7 @@ export const CLOSE_ROOM_FULL = 4003;
 export const CLOSE_AUTH = 4004;
 export const CLOSE_STORAGE_FULL = 4005;
 export const CLOSE_UNKNOWN_ROOM = 4006;
+export const CLOSE_REPLACED = 4007;
 
 const DEVICE_ID = /^[0-9a-f]{8}$/;
 const PUSH_TOKEN = /^[A-Za-z0-9_:.-]{1,512}$/;
@@ -38,6 +41,7 @@ interface Attachment {
   d: string | null;
   tk: number;
   at: number;
+  o?: number;
 }
 
 interface Record {
@@ -60,6 +64,7 @@ const SLUG: { [code: number]: string } = {
   [CLOSE_AUTH]: "auth",
   [CLOSE_STORAGE_FULL]: "storage",
   [CLOSE_UNKNOWN_ROOM]: "unknown",
+  [CLOSE_REPLACED]: "replaced",
 };
 
 function byteLength(text: string): number {
@@ -119,13 +124,14 @@ export class Room extends DurableObject<PushEnv> {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    if (this.ctx.getWebSockets().length >= MAX_SOCKETS) {
+    if (this.pendingSockets() >= MAX_PENDING_SOCKETS) {
       server.accept();
       this.reject(server, CLOSE_ROOM_FULL, "room is full");
       return new Response(null, { status: 101, webSocket: client });
     }
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ d: null, tk: RATE_TOKENS, at: Date.now() } satisfies Attachment);
+    const now = Date.now();
+    server.serializeAttachment({ d: null, tk: RATE_TOKENS, at: now, o: now } satisfies Attachment);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -219,6 +225,8 @@ export class Room extends DurableObject<PushEnv> {
     const deviceExpected = await tag(await importAuthKey(deviceKeyBytes), helloInput(device, frame.ts));
     if (!timingSafeEqual(deviceExpected, deviceOffered)) throw new Fail(CLOSE_AUTH, "bad device tag");
 
+    this.admit(ws, device);
+
     if (!existing) {
       this.sql.exec(
         "INSERT INTO room (id, auth_key, created_at) VALUES (1, ?, ?)",
@@ -301,6 +309,37 @@ export class Room extends DurableObject<PushEnv> {
       this.send(peer, fresh);
     }
     this.wake(connected);
+  }
+
+  private pendingSockets(): number {
+    const now = Date.now();
+    let pending = 0;
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      const attachment = socket.deserializeAttachment() as Attachment | null;
+      if (attachment?.d) continue;
+      if (now - (attachment?.o ?? attachment?.at ?? 0) > HELLO_DEADLINE_MS) {
+        this.reject(socket, CLOSE_PROTOCOL, "hello timed out");
+        continue;
+      }
+      pending++;
+    }
+    return pending;
+  }
+
+  private admit(ws: WebSocket, device: string): void {
+    let members = 0;
+    for (const peer of this.ctx.getWebSockets()) {
+      if (peer === ws || peer.readyState !== WebSocket.OPEN) continue;
+      const attachment = peer.deserializeAttachment() as Attachment | null;
+      if (!attachment?.d) continue;
+      if (attachment.d === device) {
+        this.reject(peer, CLOSE_REPLACED, "replaced by a newer connection");
+        continue;
+      }
+      members++;
+    }
+    if (members >= MAX_SOCKETS) throw new Fail(CLOSE_ROOM_FULL, "room is full");
   }
 
   private register(device: string, value: unknown): void {

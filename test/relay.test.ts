@@ -1,7 +1,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Client, authKey, helloFrame, record, roomId } from "./client";
-import { UNCLAIMED_TTL_MS, type Room } from "../src/room";
+import { HELLO_DEADLINE_MS, UNCLAIMED_TTL_MS, type Room } from "../src/room";
 
 async function join(
   room: string,
@@ -187,15 +187,49 @@ describe("limits", () => {
     expect((await a.closure()).code).toBe(4001);
   });
 
-  it("closes 4003 on the ninth socket in a room", async () => {
+  it("closes 4003 on the ninth device in a room", async () => {
     const room = roomId();
     const key = authKey();
     const first = await join(room, key, "aaaaaaaa", {}, true);
     await first.next();
-    const rest = [];
-    for (let i = 1; i < 8; i++) rest.push(await Client.connect(room));
+    for (let i = 1; i < 8; i++) {
+      const member = await join(room, key, `0000000${i}`);
+      await member.next();
+    }
+    const overflow = await join(room, key, "99999999");
+    expect((await overflow.closure()).code).toBe(4003);
+  });
+
+  it("closes 4003 once four sockets are waiting to say hello", async () => {
+    const room = roomId();
+    const waiting = [];
+    for (let i = 0; i < 4; i++) waiting.push(await Client.connect(room));
     const overflow = await Client.connect(room);
     expect((await overflow.closure()).code).toBe(4003);
+  });
+
+  it("closes a socket that never says hello once a newcomer arrives", async () => {
+    const room = roomId();
+    const silent = await Client.connect(room);
+    await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) => {
+      for (const socket of state.getWebSockets()) {
+        const attachment = socket.deserializeAttachment() as { o: number };
+        socket.serializeAttachment({ ...attachment, o: attachment.o - HELLO_DEADLINE_MS - 1 });
+      }
+    });
+    await Client.connect(room);
+    expect((await silent.closure()).code).toBe(4002);
+  });
+
+  it("replaces a device's older socket when it says hello again", async () => {
+    const room = roomId();
+    const key = authKey();
+    const stale = await join(room, key, "aaaaaaaa", {}, true);
+    await stale.next();
+    const fresh = await join(room, key, "aaaaaaaa");
+    expect(await fresh.next()).toEqual({ t: "ops", o: [] });
+    expect((await stale.closure()).code).toBe(4007);
+    expect(fresh.closed).toBe(null);
   });
 
   it("does not count records it already holds against the cap", async () => {

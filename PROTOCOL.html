@@ -397,11 +397,12 @@ sessionTag    = HMAC-SHA256(sessionKey,   "ble" ‖ u64be(window))[0..2]    <spa
           <tr><td class="mono">1000</td><td>—</td><td>Client sent <code>bye</code></td></tr>
           <tr><td class="mono">1001</td><td>—</td><td>Room alarm fired; the room's records are gone</td></tr>
           <tr><td class="mono">4001</td><td class="mono">rate</td><td>More than 20 messages per 10 s on one socket</td></tr>
-          <tr><td class="mono">4002</td><td class="mono">proto</td><td>Binary frame, over 4096 bytes, malformed JSON, unknown <code>t</code>, bad record shape</td></tr>
-          <tr><td class="mono">4003</td><td class="mono">full</td><td>Ninth socket in the room</td></tr>
+          <tr><td class="mono">4002</td><td class="mono">proto</td><td>Binary frame, over 4096 bytes, malformed JSON, unknown <code>t</code>, bad record shape, or no hello within 10 s</td></tr>
+          <tr><td class="mono">4003</td><td class="mono">full</td><td>Ninth device in the room, or a fifth socket still waiting to say hello</td></tr>
           <tr><td class="mono">4004</td><td class="mono">auth</td><td>Bad hello tag, stale <code>ts</code>, bad record tag, or a record claiming another device</td></tr>
           <tr><td class="mono">4005</td><td class="mono">storage</td><td>A single frame larger than the whole 500-record room</td></tr>
           <tr><td class="mono">4006</td><td class="mono">unknown</td><td>Room has no key registered; resend hello with <code>k</code></td></tr>
+          <tr><td class="mono">4007</td><td class="mono">replaced</td><td>The same device said hello on a newer socket</td></tr>
         </tbody>
       </table>
     </div>

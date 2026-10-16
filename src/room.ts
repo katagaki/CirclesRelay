@@ -20,7 +20,9 @@ export const MAX_RECORDS_PER_FRAME = 32;
 export const RATE_TOKENS = 20;
 export const RATE_WINDOW_MS = 10_000;
 export const MAX_SOCKETS = 8;
-export const MAX_STORED_RECORDS = 500;
+export const MAX_DEVICES = 16;
+export const MAX_RECORDS_PER_DEVICE = 500;
+export const MAX_STORED_RECORDS = MAX_DEVICES * MAX_RECORDS_PER_DEVICE;
 export const HELLO_SKEW_SECONDS = 300;
 export const ROOM_TTL_MS = 48 * 60 * 60 * 1000;
 export const PUSH_COALESCE_MS = 10_000;
@@ -84,34 +86,6 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
   constructor(ctx: DurableObjectState, env: PushEnv & AttestEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS ops (
-      device TEXT    NOT NULL,
-      seq    INTEGER NOT NULL,
-      blob   BLOB    NOT NULL,
-      tag    BLOB    NOT NULL,
-      ts     INTEGER NOT NULL,
-      PRIMARY KEY (device, seq)
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS room (
-      id         INTEGER PRIMARY KEY CHECK (id = 1),
-      auth_key   BLOB    NOT NULL,
-      created_at INTEGER NOT NULL
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS tokens (
-      device   TEXT    PRIMARY KEY,
-      platform TEXT    NOT NULL,
-      token    TEXT    NOT NULL,
-      env      TEXT    NOT NULL,
-      pushed   INTEGER NOT NULL
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS devices (
-      device   TEXT PRIMARY KEY,
-      auth_key BLOB NOT NULL
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS hellos (
-      digest BLOB    PRIMARY KEY,
-      ts     INTEGER NOT NULL
-    )`);
     for (const socket of ctx.getWebSockets()) {
       if (!(socket.deserializeAttachment() as Attachment | null)?.d) this.reject(socket, CLOSE_AUTH, "authentication required");
     }
@@ -160,11 +134,7 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
   }
 
   override async alarm(): Promise<void> {
-    this.sql.exec("DELETE FROM ops");
-    this.sql.exec("DELETE FROM room");
-    this.sql.exec("DELETE FROM tokens");
-    this.sql.exec("DELETE FROM devices");
-    this.sql.exec("DELETE FROM hellos");
+    await this.ctx.storage.deleteAll();
     for (const ws of this.ctx.getWebSockets()) ws.close(1001, "room expired");
   }
 
@@ -232,6 +202,11 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
     const deviceExpected = await tag(await importAuthKey(deviceKeyBytes), helloInput(device, frame.ts));
     if (!timingSafeEqual(deviceExpected, deviceOffered)) throw new Fail(CLOSE_AUTH, "bad device tag");
 
+    this.createTables();
+    if (!registeredDeviceKey && this.deviceCount() >= MAX_DEVICES) {
+      throw new Fail(CLOSE_ROOM_FULL, "room has too many devices");
+    }
+
     this.sql.exec("DELETE FROM hellos WHERE ts < ?", Math.floor(Date.now() / 1000) - HELLO_SKEW_SECONDS);
     const digest = await sha256(bytes);
     if (this.sql.exec("INSERT OR IGNORE INTO hellos (digest, ts) VALUES (?, ?)", digest, frame.ts).rowsWritten === 0) {
@@ -289,8 +264,8 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
       if (pending.has(id) || this.holds(record.d, record.n)) continue;
       pending.add(id);
     }
-    if (this.count() + pending.size > MAX_STORED_RECORDS) {
-      throw new Fail(CLOSE_STORAGE_FULL, "room is full");
+    if (this.count(attachment.d) + pending.size > MAX_RECORDS_PER_DEVICE) {
+      throw new Fail(CLOSE_STORAGE_FULL, "device record quota reached");
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -382,12 +357,49 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
     }
   }
 
+  private createTables(): void {
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS ops (
+      device TEXT    NOT NULL,
+      seq    INTEGER NOT NULL,
+      blob   BLOB    NOT NULL,
+      tag    BLOB    NOT NULL,
+      ts     INTEGER NOT NULL,
+      PRIMARY KEY (device, seq)
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS room (
+      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      auth_key   BLOB    NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS tokens (
+      device   TEXT    PRIMARY KEY,
+      platform TEXT    NOT NULL,
+      token    TEXT    NOT NULL,
+      env      TEXT    NOT NULL,
+      pushed   INTEGER NOT NULL
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS devices (
+      device   TEXT PRIMARY KEY,
+      auth_key BLOB NOT NULL
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS hellos (
+      digest BLOB    PRIMARY KEY,
+      ts     INTEGER NOT NULL
+    )`);
+  }
+
+  private hasTables(): boolean {
+    return this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'room'").toArray().length > 0;
+  }
+
   private authKey(): Uint8Array | null {
+    if (!this.hasTables()) return null;
     const row = this.sql.exec("SELECT auth_key FROM room WHERE id = 1").toArray()[0];
     return row ? toBytes(row.auth_key as ArrayBuffer) : null;
   }
 
   private deviceKey(device: string): Uint8Array | null {
+    if (!this.hasTables()) return null;
     const row = this.sql.exec("SELECT auth_key FROM devices WHERE device = ?", device).toArray()[0];
     return row ? toBytes(row.auth_key as ArrayBuffer) : null;
   }
@@ -406,8 +418,12 @@ export class Room extends DurableObject<PushEnv & AttestEnv> {
     return next - 1;
   }
 
-  private count(): number {
-    return Number(this.sql.exec("SELECT COUNT(*) AS c FROM ops").one().c);
+  private count(device: string): number {
+    return Number(this.sql.exec("SELECT COUNT(*) AS c FROM ops WHERE device = ?", device).one().c);
+  }
+
+  private deviceCount(): number {
+    return Number(this.sql.exec("SELECT COUNT(*) AS c FROM devices").one().c);
   }
 
   private missing(vector: unknown): Record[] {

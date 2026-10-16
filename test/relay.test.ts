@@ -19,6 +19,20 @@ function stub(room: string): DurableObjectStub<Room> {
   return env.ROOM.get(env.ROOM.idFromName(room));
 }
 
+function tables(state: DurableObjectState): unknown[] {
+  return state.storage.sql
+    .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'")
+    .toArray()
+    .map((row) => row.name);
+}
+
+function state(room: string): Promise<{ tables: unknown[]; alarm: number | null }> {
+  return runInDurableObject(stub(room), async (_instance: Room, state: DurableObjectState) => ({
+    tables: tables(state),
+    alarm: await state.storage.getAlarm(),
+  }));
+}
+
 async function stored(room: string, device: string, seq: number): Promise<void> {
   for (let attempt = 0; attempt < 150; attempt++) {
     const arrived = await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) =>
@@ -333,7 +347,51 @@ describe("limits", () => {
     });
   });
 
-  it("rejects new records rather than evicting history once the room is full", async () => {
+  it("refuses a new device once the room has registered its device cap", async () => {
+    const room = roomId();
+    const key = authKey();
+    const first = await join(room, key, "aaaaaaaa", {}, true);
+    await first.next();
+    first.send({ t: "bye" });
+    await first.closure();
+    for (let i = 1; i < 16; i++) {
+      const member = await join(room, key, i.toString(16).padStart(8, "0"));
+      await member.next();
+      member.send({ t: "bye" });
+      await member.closure();
+    }
+    const overflow = await join(room, key, "99999999");
+    expect((await overflow.closure()).code).toBe(4003);
+    const returning = await join(room, key, "aaaaaaaa");
+    expect(await returning.next()).toEqual({ t: "ops", o: [] });
+    await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) => {
+      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM devices").one().c)).toBe(16);
+    });
+  });
+
+  it("lets other devices keep writing after one device reaches its quota", async () => {
+    const room = roomId();
+    const key = authKey();
+    const a = await join(room, key, "aaaaaaaa", {}, true);
+    await a.next();
+    let seq = 1;
+    for (let frame = 0; frame < 16; frame++) {
+      const size = frame === 15 ? 20 : 32;
+      const ops = [];
+      for (let i = 0; i < size; i++) ops.push(await record(key, "aaaaaaaa", seq++, `o${seq}`));
+      a.send({ t: "ops", o: ops });
+    }
+    a.send({ t: "ops", o: [await record(key, "aaaaaaaa", seq, "overflow")] });
+    expect((await a.closure()).code).toBe(4005);
+
+    const b = await join(room, key, "bbbbbbbb", { aaaaaaaa: 500 });
+    expect(await b.next()).toEqual({ t: "ops", o: [] });
+    b.send({ t: "ops", o: [await record(key, "bbbbbbbb", 1, "after")] });
+    await stored(room, "bbbbbbbb", 1);
+    expect(b.closed).toBe(null);
+  });
+
+  it("rejects new records rather than evicting history once a device reaches its quota", async () => {
     const room = roomId();
     const key = authKey();
     const a = await join(room, key, "aaaaaaaa", {}, true);
@@ -461,10 +519,23 @@ describe("lifetime", () => {
 
     expect(await runDurableObjectAlarm(stub(room))).toBe(true);
     await runInDurableObject(stub(room), (_instance: Room, state: DurableObjectState) => {
-      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM ops").one().c)).toBe(0);
-      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM room").one().c)).toBe(0);
-      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM hellos").one().c)).toBe(0);
+      expect(tables(state)).toEqual([]);
     });
+    expect((await state(room)).alarm).toBe(null);
     expect((await a.closure()).code).toBe(1001);
+  });
+
+  it("leaves no storage behind for hellos that never register a room", async () => {
+    const room = roomId();
+    const unknown = await Client.connect(room);
+    unknown.send(await helloFrame(authKey(), "aaaaaaaa"));
+    expect((await unknown.closure()).code).toBe(4006);
+
+    const forged = await Client.connect(room);
+    const frame = await helloFrame(authKey(), "aaaaaaaa", {}, { register: authKey() });
+    forged.send(frame);
+    expect((await forged.closure()).code).toBe(4004);
+
+    expect(await state(room)).toEqual({ tables: [], alarm: null });
   });
 });

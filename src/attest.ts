@@ -144,7 +144,7 @@ async function enroll(
   const statement = asMap(map.attStmt);
   if (!statement) return fail("bad attestation statement");
   const offered = statement.x5c;
-  if (!Array.isArray(offered) || offered.length < 2) return fail("bad certificate chain");
+  if (!Array.isArray(offered) || offered.length !== 2) return fail("bad certificate chain");
   const chain: Uint8Array[] = [];
   for (const der of offered) {
     if (!(der instanceof Uint8Array)) return fail("bad certificate");
@@ -219,26 +219,39 @@ async function reassert(
   return { ok: true, kind: "appattest", keyId: enrolled.keyId, pubkey: enrolled.pubkey, counter: parsed.counter };
 }
 
-async function verifyChain(chain: Uint8Array[]): Promise<x509.X509Certificate | null> {
+export async function verifyChain(
+  chain: Uint8Array[],
+  rootPem: string = APPLE_ROOT_PEM,
+): Promise<x509.X509Certificate | null> {
   if (!provider) {
     x509.cryptoProvider.set(crypto as unknown as Crypto);
     provider = true;
   }
-  const root = new x509.X509Certificate(APPLE_ROOT_PEM);
-  let full: x509.X509Certificate[];
+  if (chain.length !== 2) return null;
+  let leaf: x509.X509Certificate;
+  let intermediate: x509.X509Certificate;
+  let root: x509.X509Certificate;
   try {
-    full = [...chain.map((der) => new x509.X509Certificate(der as BufferSource)), root];
+    leaf = new x509.X509Certificate(chain[0] as BufferSource);
+    intermediate = new x509.X509Certificate(chain[1] as BufferSource);
+    root = new x509.X509Certificate(rootPem);
   } catch {
     return null;
   }
   const now = new Date();
-  for (let i = 0; i < full.length; i++) {
-    const cert = full[i];
+  for (const cert of [leaf, intermediate, root]) {
     if (cert.notBefore > now || cert.notAfter < now) return null;
-    const parent = full[i + 1] ?? root;
-    if (!(await cert.verify({ publicKey: parent.publicKey, signatureOnly: true }))) return null;
   }
-  return full[0];
+  const leafConstraints = leaf.getExtension(x509.BasicConstraintsExtension);
+  if (leafConstraints?.ca) return null;
+  const constraints = intermediate.getExtension(x509.BasicConstraintsExtension);
+  if (!constraints?.ca) return null;
+  const usage = intermediate.getExtension(x509.KeyUsagesExtension);
+  if (!usage || !(usage.usages & x509.KeyUsageFlags.keyCertSign)) return null;
+  if (leaf.issuer !== intermediate.subject || intermediate.issuer !== root.subject) return null;
+  if (!(await leaf.verify({ publicKey: intermediate.publicKey, signatureOnly: true }))) return null;
+  if (!(await intermediate.verify({ publicKey: root.publicKey, signatureOnly: true }))) return null;
+  return leaf;
 }
 
 function certificateNonce(cert: x509.X509Certificate): Uint8Array | null {

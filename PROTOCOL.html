@@ -380,7 +380,7 @@ sessionTag    = HMAC-SHA256(sessionKey,   "ble" ‖ u64be(window))[0..2]    <spa
         { "t": "appattest", "k": keyId, "s": assertion }          <span class="c">// every hello after</span>
 Google  { "t": "playintegrity", "tk": token }                     <span class="c">// standard request, every hello</span></pre>
       <p>
-        Apple's path enrolls once — chain to Apple's App Attest root, nonce, key id, app id,
+        Apple's path enrolls once — an <code>x5c</code> of exactly leaf and intermediate, the intermediate a CA allowed to sign certificates and signed by the pinned App Attest root, the leaf not a CA, nonce, key id, app id,
         zero counter, environment — and then verifies a cheap assertion against the stored
         key in a separate identity object, refusing any counter that fails to advance. Every
         re-enrollment of the same key is refused, so a replayed enrollment cannot reset it. Google's path

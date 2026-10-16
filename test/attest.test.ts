@@ -1,5 +1,6 @@
 import { env as workerEnv, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import * as x509 from "@peculiar/x509";
 import { decodeCbor } from "../src/cbor";
 import {
   type AttestEnv,
@@ -8,6 +9,7 @@ import {
   attestMode,
   isLoopback,
   verifyAttestation,
+  verifyChain,
 } from "../src/attest";
 import worker, { ATTEST_HEADER, HELLO_HEADER, type Env } from "../src/index";
 import { attestInput, b64urlEncode, sha256 } from "../src/proto";
@@ -235,19 +237,168 @@ describe("app attest", () => {
     expect(result).toEqual({ ok: false, reason: "untrusted certificate chain" });
   });
 
-  it("refuses a single certificate, which can only be self-signed", async () => {
-    const object = cborMap([
-      ["fmt", cborText("apple-appattest")],
-      ["authData", cborBytes(new Uint8Array(87))],
-      ["attStmt", [...cborMap([["x5c", cborArray([cborBytes(new Uint8Array(4))])]])]],
-    ]);
-    const result = await verifyAttestation(
-      env(),
-      { t: "appattest", k: base64url(new Uint8Array(32)), o: base64url(object) },
-      hash,
-      null,
-    );
-    expect(result).toEqual({ ok: false, reason: "bad certificate chain" });
+  it("refuses any chain other than a leaf and one intermediate", async () => {
+    for (const count of [1, 3]) {
+      const object = cborMap([
+        ["fmt", cborText("apple-appattest")],
+        ["authData", cborBytes(new Uint8Array(87))],
+        ["attStmt", [...cborMap([["x5c", cborArray(Array.from({ length: count }, () => cborBytes(new Uint8Array(4))))]])]],
+      ]);
+      const result = await verifyAttestation(
+        env(),
+        { t: "appattest", k: base64url(new Uint8Array(32)), o: base64url(object) },
+        hash,
+        null,
+      );
+      expect(result).toEqual({ ok: false, reason: "bad certificate chain" });
+    }
+  });
+});
+
+describe("certificate chain", () => {
+  const ec = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" };
+  const day = 86_400_000;
+
+  interface Issued {
+    cert: x509.X509Certificate;
+    keys: CryptoKeyPair;
+  }
+
+  async function keys(): Promise<CryptoKeyPair> {
+    return (await crypto.subtle.generateKey(ec, true, ["sign", "verify"])) as CryptoKeyPair;
+  }
+
+  async function makeRoot(): Promise<Issued> {
+    x509.cryptoProvider.set(crypto as unknown as Crypto);
+    const pair = await keys();
+    const cert = await x509.X509CertificateGenerator.createSelfSigned({
+      serialNumber: "01",
+      name: "CN=Test Root",
+      notBefore: new Date(Date.now() - day),
+      notAfter: new Date(Date.now() + day),
+      signingAlgorithm: ec,
+      keys: pair,
+      extensions: [
+        new x509.BasicConstraintsExtension(true, undefined, true),
+        new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign | x509.KeyUsageFlags.cRLSign, true),
+      ],
+    });
+    return { cert, keys: pair };
+  }
+
+  async function issue(
+    parent: Issued,
+    name: string,
+    extensions: x509.Extension[],
+    validity: { notBefore?: Date; notAfter?: Date } = {},
+  ): Promise<Issued> {
+    const pair = await keys();
+    const cert = await x509.X509CertificateGenerator.create({
+      serialNumber: "02",
+      subject: name,
+      issuer: parent.cert.subject,
+      notBefore: validity.notBefore ?? new Date(Date.now() - day),
+      notAfter: validity.notAfter ?? new Date(Date.now() + day),
+      signingAlgorithm: ec,
+      publicKey: pair.publicKey,
+      signingKey: parent.keys.privateKey,
+      extensions,
+    });
+    return { cert, keys: pair };
+  }
+
+  const caExtensions = () => [
+    new x509.BasicConstraintsExtension(true, 0, true),
+    new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign | x509.KeyUsageFlags.cRLSign, true),
+  ];
+  const leafExtensions = () => [
+    new x509.BasicConstraintsExtension(false, undefined, true),
+    new x509.KeyUsagesExtension(x509.KeyUsageFlags.digitalSignature, true),
+  ];
+  const der = (issued: Issued) => new Uint8Array(issued.cert.rawData);
+
+  let root: Issued;
+  let intermediate: Issued;
+  let leaf: Issued;
+
+  beforeAll(async () => {
+    root = await makeRoot();
+    intermediate = await issue(root, "CN=Test Intermediate", caExtensions());
+    leaf = await issue(intermediate, "CN=Test Leaf", leafExtensions());
+  });
+
+  it("accepts exactly a leaf and a CA intermediate that chain to the pinned root", async () => {
+    const result = await verifyChain([der(leaf), der(intermediate)], root.cert.toString("pem"));
+    expect(result?.subject).toBe("CN=Test Leaf");
+  });
+
+  it("refuses the same chain against Apple's root", async () => {
+    expect(await verifyChain([der(leaf), der(intermediate)])).toBeNull();
+  });
+
+  it("refuses a chain that is not exactly two certificates", async () => {
+    const pem = root.cert.toString("pem");
+    expect(await verifyChain([der(leaf)], pem)).toBeNull();
+    expect(await verifyChain([der(leaf), der(intermediate), der(root)], pem)).toBeNull();
+    const deeper = await issue(intermediate, "CN=Second Intermediate", caExtensions());
+    const deepLeaf = await issue(deeper, "CN=Deep Leaf", leafExtensions());
+    expect(await verifyChain([der(deepLeaf), der(deeper), der(intermediate)], pem)).toBeNull();
+  });
+
+  it("refuses an intermediate that is not a CA", async () => {
+    const pem = root.cert.toString("pem");
+    for (const extensions of [
+      [new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign, true)],
+      [new x509.BasicConstraintsExtension(false, undefined, true), new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign, true)],
+    ]) {
+      const bad = await issue(root, "CN=Not A CA", extensions);
+      const child = await issue(bad, "CN=Test Leaf", leafExtensions());
+      expect(await verifyChain([der(child), der(bad)], pem)).toBeNull();
+    }
+  });
+
+  it("refuses an intermediate that may not sign certificates", async () => {
+    const pem = root.cert.toString("pem");
+    for (const extensions of [
+      [new x509.BasicConstraintsExtension(true, 0, true)],
+      [new x509.BasicConstraintsExtension(true, 0, true), new x509.KeyUsagesExtension(x509.KeyUsageFlags.digitalSignature, true)],
+    ]) {
+      const bad = await issue(root, "CN=No Cert Sign", extensions);
+      const child = await issue(bad, "CN=Test Leaf", leafExtensions());
+      expect(await verifyChain([der(child), der(bad)], pem)).toBeNull();
+    }
+  });
+
+  it("refuses a leaf that claims to be a CA", async () => {
+    const bad = await issue(intermediate, "CN=Test Leaf", caExtensions());
+    expect(await verifyChain([der(bad), der(intermediate)], root.cert.toString("pem"))).toBeNull();
+  });
+
+  it("refuses an intermediate signed by some other root", async () => {
+    const other = await makeRoot();
+    const stray = await issue(other, "CN=Test Intermediate", caExtensions());
+    const child = await issue(stray, "CN=Test Leaf", leafExtensions());
+    expect(await verifyChain([der(child), der(stray)], root.cert.toString("pem"))).toBeNull();
+  });
+
+  it("refuses a leaf signed by some other intermediate", async () => {
+    const sibling = await issue(root, "CN=Test Intermediate", caExtensions());
+    expect(await verifyChain([der(leaf), der(sibling)], root.cert.toString("pem"))).toBeNull();
+  });
+
+  it("refuses an expired or not yet valid certificate", async () => {
+    const pem = root.cert.toString("pem");
+    const expired = await issue(intermediate, "CN=Test Leaf", leafExtensions(), {
+      notBefore: new Date(Date.now() - 2 * day),
+      notAfter: new Date(Date.now() - day),
+    });
+    expect(await verifyChain([der(expired), der(intermediate)], pem)).toBeNull();
+    const early = await issue(root, "CN=Test Intermediate", caExtensions(), {
+      notBefore: new Date(Date.now() + day),
+      notAfter: new Date(Date.now() + 2 * day),
+    });
+    const child = await issue(early, "CN=Test Leaf", leafExtensions());
+    expect(await verifyChain([der(child), der(early)], pem)).toBeNull();
   });
 });
 
